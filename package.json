@@ -4,6 +4,7 @@
     "dependencies": {
     "express": "2.5.x"
     },
+    "main": "server.js",
     "engines": {
     "node": "0.8.x",
     "npm": "1.1.x"
