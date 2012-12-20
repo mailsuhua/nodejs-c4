@@ -8,7 +8,7 @@ var net = require('net');
 var HashMap = require('./hashmap.js').HashMap;
 var ev = require('./event.js');
 
-var VERSION="0.19.3"
+var VERSION="0.20.0"
 
 var userMap = new HashMap();
 
@@ -22,6 +22,7 @@ function newSession(user, hash){
    obj.sequence = 0;
    obj.cachedEvents = [];
    obj.closed = false;
+   
    obj.close = function() {
       if(null != obj.socket){
         obj.socket.destroy();
@@ -45,7 +46,20 @@ function newSession(user, hash){
         obj.socket.pause();
       }
    }
-
+   obj.writeCloseEvent = function(sockAddr){
+      var closed = ev.newEvent(EVENT_TCP_CONNECTION_TYPE, 1, obj.sid);  
+      closed.status =  TCP_CONN_CLOSED;
+      closed.addr =  sockAddr;
+      if(null != obj.writer){
+        obj.writer.write(ev.encodeChunkConnectionEvent(closed));
+      }else{
+          //cache this event.
+        obj.cachedEvents.push(ev.encodeChunkConnectionEvent(closed));
+      } 
+      if(obj.closed || sockAddr == (obj.remoteHost + ":" + obj.remotePort)){
+        obj.endWriter();
+      } 
+   }
    return obj;
 }
 
@@ -109,10 +123,15 @@ function now(){
 function onInvoke(request, response) {
    var length = parseInt(request.headers['content-length']);
    var user = request.headers['usertoken'];
-   var miscInfo = request.headers['c4miscinfo'].split('_');
-   var ispull = (miscInfo[0] == 'pull');
-   var timeout = parseInt(miscInfo[1]);
-   var maxread = parseInt(miscInfo[2]);
+   var ispull = (url.parse(request.url).pathname == '/pull');
+   if(ispull)
+   {
+      var miscInfo = request.headers['c4miscinfo'].split('_');
+      var timeout = parseInt(miscInfo[0]);
+      var maxread = parseInt(miscInfo[1]);
+   }
+   
+   
    var postData = new Buffer(length);
    var recvlen = 0;
    var responsed = false;
@@ -125,7 +144,7 @@ function onInvoke(request, response) {
        if(null != currentSession && currentSession.writer != null){
          currentSession.endWriter();
        }else{
-        response.end();
+         response.end();
        }
       }, timeout*1000);
    }
@@ -165,6 +184,7 @@ function onInvoke(request, response) {
               case HTTP_REQUEST_EVENT_TYPE:
               {
                 var writer = ispull?response:null;
+                var requestEv = evv;
                 var session = getCreateSession(user, evv.hash, writer);
                 currentSession = session;
                 var host = evv.host;
@@ -178,8 +198,8 @@ function onInvoke(request, response) {
                   port = parseInt(ss[1]);
                 }
 
-                if(null != session.socket && session.remoteHost == host && session.remotePort == port){
-                    session.socket.write(evv.rawContent);
+                if(null != session.socket && session.remoteHost == host && session.remotePort == port && requestEv.method.toLowerCase() != 'connect'){
+                    session.socket.write(requestEv.rawContent);
                     return;
                 }
                 session.remoteHost = host;
@@ -194,7 +214,7 @@ function onInvoke(request, response) {
                     session.socket = client;
                     session.socket.pause();
                     session.sequence = 0;
-                    if(evv.method.toLowerCase() == 'connect'){
+                    if(requestEv.method.toLowerCase() == 'connect'){
                       var established = ev.newEvent(EVENT_TCP_CHUNK_TYPE, 1, session.sid);
                       established.seq = session.sequence++;
                       established.content=new Buffer("HTTP/1.1 200 OK\r\n\r\n");
@@ -205,7 +225,7 @@ function onInvoke(request, response) {
                         session.cachedEvents.push(ev.encodeChunkTcpChunkEvent(established));
                       }
                     }else{
-                      session.socket.write(evv.rawContent);
+                      session.socket.write(requestEv.rawContent);
                       //console.log("####writed:" + evv.rawContent.toString());
                     }       
                 });
@@ -231,21 +251,9 @@ function onInvoke(request, response) {
                    console.log("####Failed to connect:" + remoteaddr + " :" + err);           
                 });
                 client.on('close', function(had_error) {
-                   console.log("####Close connection for " + remoteaddr);    
-                   var closed = ev.newEvent(EVENT_TCP_CONNECTION_TYPE, 1, session.sid);  
-                   closed.status =  TCP_CONN_CLOSED;
-                   closed.addr =  remoteaddr;
-                   if(null != session.writer){
-                      session.writer.write(ev.encodeChunkConnectionEvent(closed));
-                    }else{
-                      //cache this event.
-                      session.cachedEvents.push(ev.encodeChunkConnectionEvent(closed));
-                    } 
-                    if(session.closed || remoteaddr == (session.remoteHost + ":" + session.remotePort)){
-                      session.endWriter();
-                    }              
+                   console.log("####Close connection for " + remoteaddr);  
+                   session.writeCloseEvent(remoteaddr);             
                 });
-                response.end();
                 break;
               }
               case EVENT_TCP_CONNECTION_TYPE:
@@ -256,7 +264,6 @@ function onInvoke(request, response) {
                 if(evv.status == TCP_CONN_CLOSED){
                     session.close();
                 }
-                response.end();
                 break;
               }
               case EVENT_TCP_CHUNK_TYPE:
@@ -265,11 +272,11 @@ function onInvoke(request, response) {
                  var session = getCreateSession(user, evv.hash, writer);
                  currentSession = session;
                  if(null == session.socket){
+                   session.writeCloseEvent(session.remoteHost + ":" + session.remotePort);  
                    response.end();
                    return;
                  }
                  session.socket.write(evv.content);
-                 response.end();
                  break;
               }
               case EVENT_SOCKET_READ_TYPE:
@@ -312,13 +319,17 @@ function onInvoke(request, response) {
       }else{
         console.log("Request not full data ");
       }
+      if(!ispull){
+          response.end();
+      }
    });
 
 }
 
 var handle = {}
 handle["/"] = onIndex;
-handle["/invoke2"] = onInvoke;
+handle["/push"] = onInvoke;
+handle["/pull"] = onInvoke;
 
 function route(pathname, request, response) {
   if (typeof handle[pathname] === 'function') {
