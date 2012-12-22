@@ -225,6 +225,8 @@ function decodeRawEvent(type, version, data){
    return ev;
 }
 
+exports.decodeEvent = decodeEvent;
+
 function decodeEvent(data){
   var type = readUvarint(data);
   var version = readUvarint(data);
