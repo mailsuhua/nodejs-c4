@@ -23,6 +23,8 @@ function newSession(user, hash){
    obj.sequence = 0;
    obj.cachedEvents = [];
    obj.closed = false;
+   obj.pausecb = null;
+   obj.paused = false;
    obj.passiveread = true;
    obj.closecb = null;
    obj.close = function() {
@@ -51,6 +53,21 @@ function newSession(user, hash){
       }
    }
 
+   obj.cacheData  = function(data){
+      obj.cachedEvents.push(data);
+   }
+
+   obj.pause  = function(){
+      if(null != obj.socket){
+        obj.socket.pause();
+        if(null != obj.pausecb)
+        {
+          obj.pausecb();
+        }
+      }
+      obj.paused = true;
+   }
+
    obj.checkCachedData = function(){
       if(null == obj.writer || obj.closed)
       {
@@ -62,10 +79,6 @@ function newSession(user, hash){
           }
       }
       obj.cachedEvents= [];
-      if(obj.socket != null)
-      {
-        obj.socket.resume();
-      }
     };
 
    return obj;
@@ -160,8 +173,8 @@ function handleEvent(evv, user, writer, passiveread, allsessions){
       var client = net.connect(port, host ,  function() { 
         console.log("####Connected:" + remoteaddr + " for hash:" + evv.hash);
         session.socket = client;
-        if(passiveread){
-          session.socket.pause();
+        if(passiveread || session.paused){
+          session.pause();
         }
         session.sequence = 0;
         if(evv.method.toLowerCase() == 'connect'){
@@ -172,7 +185,7 @@ function handleEvent(evv, user, writer, passiveread, allsessions){
           {
             session.writer.write(ev.encodeChunkTcpChunkEvent(established));
           }else{
-            session.cachedEvents.push(ev.encodeChunkTcpChunkEvent(established));
+            session.cacheData(ev.encodeChunkTcpChunkEvent(established));
           }
         }else{
           session.socket.write(evv.rawContent);
@@ -183,17 +196,15 @@ function handleEvent(evv, user, writer, passiveread, allsessions){
         var chunk = ev.newEvent(EVENT_TCP_CHUNK_TYPE, 1, session.sid);
         chunk.seq = session.sequence++;
         chunk.content=data;   
-        //console.log("###[" + session.sid + "]recv chunk:" + data.length);
-        if(null != session.writer){
+        console.log("###[" + session.sid + "]recv chunk:[" + chunk.seq + ":" + data.length + "]");
+        if(null != session.writer && !session.paused){
           session.checkCachedData();
           if(!session.writer.write(ev.encodeChunkTcpChunkEvent(chunk))){
-            session.socket.pause();
-            //console.log("###[" + session.sid + "]pause again");
+            session.pause();
           }
         }else{
-          client.pause();
-          session.cachedEvents.push(ev.encodeChunkTcpChunkEvent(chunk));
-          console.log("###Invalid situataion that response writer is null.");
+          session.pause();
+          session.cacheData(ev.encodeChunkTcpChunkEvent(chunk));
         }
       });
       client.on('end', function() {
@@ -203,16 +214,17 @@ function handleEvent(evv, user, writer, passiveread, allsessions){
         console.log("####Failed to connect:" + remoteaddr + " :" + err);           
       });
       client.on('close', function(had_error) {
-        if(remoteaddr == (session.remoteHost + ":" + session.remotePort) && !session.closed){
+        if(remoteaddr == (session.remoteHost + ":" + session.remotePort)){
             console.log("####Close connection for " + remoteaddr);    
             var closed = ev.newEvent(EVENT_TCP_CONNECTION_TYPE, 1, session.sid);  
             closed.status =  TCP_CONN_CLOSED;
             closed.addr =  remoteaddr;
             if(null != session.writer){
+              session.checkCachedData();
               session.writer.write(ev.encodeChunkConnectionEvent(closed));
             }else{
               //cache this event.
-              session.cachedEvents.push(ev.encodeChunkConnectionEvent(closed));
+              session.cacheData(ev.encodeChunkConnectionEvent(closed));
             } 
             session.endWriter();
             session.close();        
@@ -224,10 +236,8 @@ function handleEvent(evv, user, writer, passiveread, allsessions){
     {
       var session = getCreateSession(user, evv.hash, writer, passiveread);
       currentSession = session;
-      if(evv.status == TCP_CONN_CLOSED){
-        session.close();
-      }
-      return session;
+      session.close();
+      return null;
     }
     case EVENT_TCP_CHUNK_TYPE:
     {
@@ -235,7 +245,7 @@ function handleEvent(evv, user, writer, passiveread, allsessions){
       currentSession = session;
       if(null == session.socket){
         session.close();
-        return;
+        return null;
       }
       session.socket.write(evv.content);
       return session;
@@ -246,7 +256,7 @@ function handleEvent(evv, user, writer, passiveread, allsessions){
         allsessions.forEach(function(sess, hash) {
            sess.checkCachedData();
         });
-        return;
+        return null;
       }
       var session = getCreateSession(user, evv.hash, writer, passiveread);
       var check = function(){
@@ -377,6 +387,7 @@ console.log('Server running at '+ ipaddr + ":" + port);
 
 var userConnTable = new HashMap();
 var userConnBufTable = new HashMap();
+var userConnCacheTable = new HashMap();
 
 function getUserConnSessionGroup(user, index){
   if(!userConnTable.has(user)){
@@ -400,28 +411,33 @@ function getUserConnBuffer(user, index){
   return bufs.get(index);
 }
 
+function getUserConnCache(user, index){
+  if(!userConnCacheTable.has(user)){
+     userConnCacheTable.set(user, new HashMap());
+  }
+  var caches = userConnCacheTable.get(user);
+  if(!caches.has(index)){
+    caches.set(index, []);
+  }
+  return caches.get(index);
+}
+
 function resumeCachedConn(ss, writer){
-  var deleteSids = [];
   ss.forEach(function(session, sid) {
-    if(null != session && null != session.socket  && !session.closed){
-      session.writer = writer;
+    session.writer = writer;
+    session.paused = false;
+    session.checkCachedData();
+    if(null != session.socket){
       session.socket.resume();
-      session.checkCachedData();
-      //console.log('########resume session:' + sess.sid);
-    }else{
-      deleteSids.push(session.sid);
     }
   });
-  for (var i = 0; i < deleteSids.length; i++)
-  {
-    ss.remove(deleteSids[i]);
-  }
 }
 
 server.on('upgrade', function(req, connection, head) {
     var user = req.headers['usertoken'];
     var localConn = connection;
     var index = req.headers['connectionindex'];
+    var keepalive = parseInt(req.headers['keep-alive']);
     console.log('Websocket establis with index:' + index);
     localConn.write(
         'HTTP/1.1 101 Web Socket Protocol Handshake\r\n' + 
@@ -432,15 +448,13 @@ server.on('upgrade', function(req, connection, head) {
     var cumulateBuf = getUserConnBuffer(user, index);
     var chunkLen = -1;
     var sesss = getUserConnSessionGroup(user, index);
+    var connCache = getUserConnCache(user, index);
     resumeCachedConn(sesss, localConn);
 
-    //for (var i = 0; i < sesss.length; i++)
-    //{
-    //  var sess = sesss[i];
-    //  sess.checkCachedData();
-    //}
-
-    //userConnTable.get(user).set(index, sesss);
+    var localConnReady = true;
+    setTimeout(function(){
+       localConn.destroy();
+      }, keepalive*1000);
     localConn.on("data", function(data) {
       if(null == cumulateBuf || cumulateBuf.length == 0){
         cumulateBuf = data;
@@ -470,7 +484,31 @@ server.on('upgrade', function(req, connection, head) {
               sesss.set(sess.sid, sess);
               sess.closecb = function(session){
                 sesss.remove(session.sid);
-                //console.log("####Sessions size:" + sesss.count());
+              };
+              sess.pausecb = function(session){
+                localConnReady = false;
+                sesss.forEach(function(session, sid) {
+                 if(null != session.socket){
+                     session.socket.pause();
+                     session.writer = null;
+                 }
+                 session.paused = true;
+                });
+
+              };
+              sess.cacheData = function(data){
+                connCache.push(data);
+              };
+              sess.checkCachedData = function(){
+                if(!localConnReady){
+                  return;
+                }
+                for(var i = 0; i < connCache.length; i++){
+                   if(!localConn.write(connCache[i])){
+                      console.log('########busy again');
+                   }
+                }
+                connCache = [];
               };
             }
           }else{
@@ -483,19 +521,22 @@ server.on('upgrade', function(req, connection, head) {
 
     });
     localConn.on("close", function() {
-      //console.log('########websocket closed');
+    console.log('@@@@@@@@@@@@websocket closed');
      sesss.forEach(function(session, sid) {
-        if(null != session && null != session.socket  && !session.closed){
-          session.socket.pause();
+        if(null != session.socket){
+           session.socket.pause();
+           session.writer = null;
         }
       });
       userConnBufTable.get(user).set(index, cumulateBuf);
+      userConnCacheTable.get(user).set(index, connCache);
     });
     localConn.on("error", function() {
 
     });
 
     localConn.on("drain", function() {
+      localConnReady = true;
       resumeCachedConn(sesss, localConn);
     });
 });
